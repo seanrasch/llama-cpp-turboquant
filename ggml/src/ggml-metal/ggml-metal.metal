@@ -621,8 +621,7 @@ void dequantize_turbo3_0(device const block_turbo3_0 * xb, short il, thread type
     reg = (type4x4) reg_f;
 }
 
-// Half-precision centroid LUT + half-precision norm multiply
-// Reduces constant memory bandwidth by 2x and avoids fp16→fp32 conversion until final output
+// Half-precision centroid LUT for vec path (2x less constant memory bandwidth)
 constant half turbo_centroids_3bit_h[8] = {
     -0.190685h, -0.117832h, -0.065717h, -0.021460h,
      0.021460h,  0.065717h,  0.117832h,  0.190685h
@@ -631,12 +630,11 @@ constant half turbo_centroids_3bit_h[8] = {
 // Vec: 4 elements per call (il ∈ {0..7}), returns type4
 template <typename type4>
 void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
-    const half nh = xb->norm;  // fp16 directly from block, no conversion
+    const half nh = xb->norm;
     const uint8_t qb = xb->qs[il];
     const uint8_t sb = xb->signs[il >> 1];
     const int sshift = (il & 1) << 2;
 
-    // All ops in fp16 until final float4 conversion
     reg = type4(float4(half4(
         turbo_centroids_3bit_h[(qb & 0x03)        | (((sb >> (sshift + 0)) & 1) << 2)] * nh,
         turbo_centroids_3bit_h[((qb >> 2) & 0x03) | (((sb >> (sshift + 1)) & 1) << 2)] * nh,
