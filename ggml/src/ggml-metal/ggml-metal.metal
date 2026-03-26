@@ -594,34 +594,48 @@ static void turbo_fwht_128_half4(thread half4 * v) {
 // With QK_TURBO3=32: nl=2 for non-vec FA (32/16), nl=8 for vec FA (32/4).
 // Much less redundant work than block-128.
 
+// Optimized turbo3 dequant: batch byte reads, unrolled index extraction.
+// Non-vec: 16 elements per call (il ∈ {0,1}), returns type4x4
 template <typename type4x4>
 void dequantize_turbo3_0(device const block_turbo3_0 * xb, short il, thread type4x4 & reg) {
     const float norm = float(xb->norm);
-    const int offset = il * 16;  // il ∈ {0,1} for block-32
+    // il=0 → elements 0-15 (qs bytes 0-3, signs bytes 0-1)
+    // il=1 → elements 16-31 (qs bytes 4-7, signs bytes 2-3)
+    const int qs_off = il * 4;
     float4x4 reg_f;
-    for (int i = 0; i < 16; i++) {
-        int j = offset + i;
-        uint8_t low2 = (xb->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
-        uint8_t hi1  = (xb->signs[j / 8] >> (j % 8)) & 0x1;
-        uint8_t idx  = low2 | (hi1 << 2);
-        reg_f[i/4][i%4] = turbo_centroids_3bit[idx] * norm;
+    for (int g = 0; g < 4; g++) {
+        // g iterates over 4 groups of 4 elements within our 16
+        // element index within block: il*16 + g*4 + k, k=0..3
+        const uint8_t qb = xb->qs[qs_off + g];
+        // signs byte index: (il*16 + g*4) / 8 = il*2 + g/2
+        const uint8_t sb = xb->signs[il * 2 + g / 2];
+        const int sshift = (g & 1) * 4;
+
+        reg_f[g] = float4(
+            turbo_centroids_3bit[(qb & 0x03)        | (((sb >> (sshift + 0)) & 1) << 2)] * norm,
+            turbo_centroids_3bit[((qb >> 2) & 0x03) | (((sb >> (sshift + 1)) & 1) << 2)] * norm,
+            turbo_centroids_3bit[((qb >> 4) & 0x03) | (((sb >> (sshift + 2)) & 1) << 2)] * norm,
+            turbo_centroids_3bit[((qb >> 6) & 0x03) | (((sb >> (sshift + 3)) & 1) << 2)] * norm
+        );
     }
     reg = (type4x4) reg_f;
 }
 
+// Vec: 4 elements per call (il ∈ {0..7}), returns type4
 template <typename type4>
 void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
     const float norm = float(xb->norm);
-    const int base = il * 4;  // il ∈ {0..7} for block-32
-    float out[4];
-    for (int li = 0; li < 4; li++) {
-        int j = base + li;
-        uint8_t low2 = (xb->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
-        uint8_t hi1  = (xb->signs[j / 8] >> (j % 8)) & 0x1;
-        uint8_t idx  = low2 | (hi1 << 2);
-        out[li] = turbo_centroids_3bit[idx] * norm;
-    }
-    reg = type4(out[0], out[1], out[2], out[3]);
+    // Codex-verified indexing: qbyte = qs[il], sbyte = signs[il>>1], sbase = (il&1)<<2
+    const uint8_t qb = xb->qs[il];
+    const uint8_t sb = xb->signs[il >> 1];
+    const int sshift = (il & 1) << 2;
+
+    reg = type4(
+        turbo_centroids_3bit[(qb & 0x03)        | (((sb >> (sshift + 0)) & 1) << 2)] * norm,
+        turbo_centroids_3bit[((qb >> 2) & 0x03) | (((sb >> (sshift + 1)) & 1) << 2)] * norm,
+        turbo_centroids_3bit[((qb >> 4) & 0x03) | (((sb >> (sshift + 2)) & 1) << 2)] * norm,
+        turbo_centroids_3bit[((qb >> 6) & 0x03) | (((sb >> (sshift + 3)) & 1) << 2)] * norm
+    );
 }
 
 // ----- turbo4 dequantize with per-thread block cache -----
@@ -2995,6 +3009,74 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float2, 2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
 #endif
+
+// ===== TurboQuant Walsh-Hadamard Transform kernel =====
+// O(d log d) rotation for 128-element groups. Replaces dense 128x128 matmul.
+// Each thread processes one 128-element group using half4 vectorized butterfly.
+// Uses the same WHT signs already defined (turbo_wht_signs1/2, turbo_wht_signs1_h4/2_h4).
+
+kernel void kernel_turbo_wht(
+        constant ggml_metal_kargs_turbo_wht & args,
+        device const float * src [[buffer(1)]],
+        device       float * dst [[buffer(2)]],
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tiitg [[thread_index_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    // Each thread handles one 128-element group
+    const int64_t group_idx = tgpig * ntg + tiitg;
+    const int64_t n_groups = args.n_elements / 128;
+    if (group_idx >= n_groups) return;
+
+    const device float * in = src + group_idx * 128;
+    device float * out = dst + group_idx * 128;
+
+    // Load into half4 vectors for fast butterfly
+    half4 v[32];
+    const bool is_inverse = (args.direction == 1);
+
+    // Apply first signs (s1 for fwd, s2 for inv)
+    for (int i = 0; i < 32; i++) {
+        float4 f = float4(in[i*4], in[i*4+1], in[i*4+2], in[i*4+3]);
+        half4 s = is_inverse ? turbo_wht_signs2_h4[i] : turbo_wht_signs1_h4[i];
+        v[i] = half4(f) * s;
+    }
+
+    // WHT butterfly (7 stages, vectorized half4)
+    // h=1: within each half4
+    for (int i = 0; i < 32; i++) {
+        half4 a = v[i];
+        v[i] = half4(a.x + a.y, a.x - a.y, a.z + a.w, a.z - a.w);
+    }
+    // h=2: within each half4
+    for (int i = 0; i < 32; i++) {
+        half4 a = v[i];
+        v[i] = half4(a.x + a.z, a.y + a.w, a.x - a.z, a.y - a.w);
+    }
+    // h=4..64: between half4 vectors
+    for (int h = 4; h < 128; h *= 2) {
+        int vec_stride = h / 4;
+        for (int i = 0; i < 32; i++) {
+            int group_pos = i % (2 * vec_stride);
+            if (group_pos < vec_stride) {
+                int partner = i + vec_stride;
+                half4 a = v[i], b = v[partner];
+                v[i]       = a + b;
+                v[partner] = a - b;
+            }
+        }
+    }
+
+    // Apply second signs + normalize, write output as fp32
+    const half4 inv_sqrt = half4(0.08838834764831845h);
+    for (int i = 0; i < 32; i++) {
+        half4 s = is_inverse ? turbo_wht_signs1_h4[i] : turbo_wht_signs2_h4[i];
+        float4 f = float4(v[i] * inv_sqrt * s);
+        out[i*4]   = f.x;
+        out[i*4+1] = f.y;
+        out[i*4+2] = f.z;
+        out[i*4+3] = f.w;
+    }
+}
 
 constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
 constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
