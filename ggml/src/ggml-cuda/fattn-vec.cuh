@@ -300,8 +300,7 @@ static __global__ void flash_attn_ext_vec(
             *((uint32_t *) &KQ_max_scale) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
             KQ_max[j] = KQ_max_new[j];
 
-            const float KQ_diff = KQ_reg[j] - KQ_max[j];
-            KQ_reg[j] = KQ_diff >= SOFTMAX_FTZ_THRESHOLD ? expf(KQ_diff) : 0.0f;
+            KQ_reg[j] = expf(KQ_reg[j] - KQ_max[j]);
             KQ_sum[j] = KQ_sum[j]*KQ_max_scale + KQ_reg[j];
             KQ[j*nthreads + tid] = KQ_reg[j];
 
@@ -420,8 +419,7 @@ static __global__ void flash_attn_ext_vec(
             *((uint32_t *) &KQ_max_scale) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
             KQ_max[j] = kqmax_new_j;
 
-            const float sink_diff = sink - KQ_max[j];
-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 && sink_diff >= SOFTMAX_FTZ_THRESHOLD ? expf(sink_diff) : 0.0f);
+            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[j]) : 0.0f);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
