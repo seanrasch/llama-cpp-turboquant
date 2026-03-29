@@ -25,6 +25,12 @@ int turbo3_cpu_wht_group_size = 0;
 #define TURBO_D             128  /* rotation group size = head_dim (independent of block size) */
 #define TURBO_QJL_CONST     1.2533141373155003f  /* sqrt(pi/2) */
 
+/* TURBO_D must match QK_TURBO3_GROUP from ggml-common.h — they represent
+ * the same rotation group size but are defined separately. Guard against
+ * silent divergence so GPU kernels and CPU reference stay in sync. */
+static_assert(TURBO_D == QK_TURBO3_GROUP,
+    "TURBO_D must equal QK_TURBO3_GROUP (rotation group size)");
+
 /* Optimal centroids from paper (scaled by 1/sqrt(d)) */
 /* 1-bit: ±sqrt(2/(pi*d)) */
 static const float CENTROIDS_1BIT[2] = { -0.070711f, 0.070711f };  /* for d=128 */
@@ -66,16 +72,18 @@ static void turbo_init_rotation(void) {
 
     const int d = TURBO_D;
 
-    /* Generate random Gaussian matrix */
+    /* Generate random Gaussian matrix directly into turbo_rotation.
+     * Previous code used a 64KB stack-local G[128*128] then memcpy'd —
+     * this segfaults on llama.cpp worker threads with reduced stack
+     * sizes (512KB macOS, 64KB some Linux configs). Writing directly
+     * into the static array avoids the stack allocation entirely. */
     turbo_prng_seed(TURBO_SEED_ROTATION);
-    float G[TURBO_D * TURBO_D];
     for (int i = 0; i < d * d; i++) {
-        G[i] = (float)turbo_prng_normal();
+        turbo_rotation[i] = (float)turbo_prng_normal();
     }
 
     /* QR decomposition via modified Gram-Schmidt */
     /* Q stored column-major in turbo_rotation */
-    memcpy(turbo_rotation, G, d * d * sizeof(float));
 
     for (int j = 0; j < d; j++) {
         /* Normalize column j */
