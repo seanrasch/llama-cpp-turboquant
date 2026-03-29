@@ -39,51 +39,42 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     const int64_t grp_in_head  = g % groups_per_head;
     const int64_t base         = head_idx * head_dim + grp_in_head * group_size;
 
-    // Each thread holds its value in a register for intra-warp stages,
-    // only spilling to shared memory for cross-warp stages (h >= 32).
     __shared__ float x[group_size];
 
-    // Load from global memory into register
-    float val = src[base + t];
+    // Load from global memory
+    x[t] = src[base + t];
+    __syncthreads();
 
     // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation)
     if (direction == 0 && scale_inv != nullptr) {
-        val *= scale_inv[t % group_size];
+        x[t] *= scale_inv[t % group_size];
+        __syncthreads();
     }
 
     // Apply first sign array
     if (group_size == 128) {
-        val *= (direction == 0) ? TURBO_WHT_SIGNS1[t] : TURBO_WHT_SIGNS2[t];
+        x[t] *= (direction == 0) ? TURBO_WHT_SIGNS1[t] : TURBO_WHT_SIGNS2[t];
     } else {
-        val *= (direction == 0) ? TURBO_WHT_SIGNS1_64[t] : TURBO_WHT_SIGNS2_64[t];
+        x[t] *= (direction == 0) ? TURBO_WHT_SIGNS1_64[t] : TURBO_WHT_SIGNS2_64[t];
     }
-
-    // WHT butterfly — intra-warp stages via warp shuffle (no barrier needed).
-    // For stage h, thread t and thread t^h are partners:
-    //   lower partner (bit h == 0): result = val + partner
-    //   upper partner (bit h == 1): result = partner - val
-#define WHT_STAGE_WARP(h) \
-    { const float other = __shfl_xor_sync(0xffffffff, val, h); \
-      val = (t & (h)) ? (other - val) : (val + other); }
-
-    WHT_STAGE_WARP(1)
-    WHT_STAGE_WARP(2)
-    WHT_STAGE_WARP(4)
-    WHT_STAGE_WARP(8)
-    WHT_STAGE_WARP(16)
-#undef WHT_STAGE_WARP
-
-    // Cross-warp stages require shared memory.
-    x[t] = val;
     __syncthreads();
 
-#define WHT_STAGE_SHARED(h) \
+    // WHT butterfly — log2(group_size) stages.
+    // In stage h, threads where (t % (2h)) < h read x[t] and x[t+h],
+    // then write x[t] = a+b and x[t+h] = a-b.  Each active thread
+    // owns a disjoint pair, so no intra-stage conflicts exist.
+#define WHT_STAGE(h) \
     if (t % (2*(h)) < (h)) { float a = x[t], b = x[t+(h)]; x[t] = a+b; x[t+(h)] = a-b; } \
     __syncthreads();
 
-    WHT_STAGE_SHARED(32)
-    if (group_size == 128) { WHT_STAGE_SHARED(64) }
-#undef WHT_STAGE_SHARED
+    WHT_STAGE(1)
+    WHT_STAGE(2)
+    WHT_STAGE(4)
+    WHT_STAGE(8)
+    WHT_STAGE(16)
+    WHT_STAGE(32)
+    if (group_size == 128) { WHT_STAGE(64) }
+#undef WHT_STAGE
 
     // Normalize and apply second sign array, write to output
     constexpr float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;

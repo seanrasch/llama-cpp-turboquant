@@ -316,34 +316,23 @@ static __global__ void k_set_rows_turbo3(
     __syncthreads();
 
     // ---- Step 4: Forward WHT (signs1 → butterfly → signs2, normalized) ----
-    // Lift value to register, apply signs, run intra-warp stages via shuffle.
-    float val = x[j];
     if (GROUP_SIZE == 128) {
-        val *= TURBO_WHT_SIGNS1[j];
+        x[j] *= TURBO_WHT_SIGNS1[j];
     } else {
-        val *= TURBO_WHT_SIGNS1_64[j];
+        x[j] *= TURBO_WHT_SIGNS1_64[j];
     }
-
-    // Intra-warp butterfly stages via warp shuffle (no barrier needed).
-#define WHT_STAGE_WARP(h) \
-    { const float other = __shfl_xor_sync(0xffffffff, val, h); \
-      val = (j & (h)) ? (other - val) : (val + other); }
-
-    WHT_STAGE_WARP(1)
-    WHT_STAGE_WARP(2)
-    WHT_STAGE_WARP(4)
-    WHT_STAGE_WARP(8)
-    WHT_STAGE_WARP(16)
-#undef WHT_STAGE_WARP
-
-    // Cross-warp stages require shared memory.
-    x[j] = val;
     __syncthreads();
 
 #define WHT_STAGE_SHARED(h) \
     if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
     __syncthreads();
 
+    // Butterfly stages: loop from h=1 to h<GROUP_SIZE, doubling each time
+    WHT_STAGE_SHARED(1)
+    WHT_STAGE_SHARED(2)
+    WHT_STAGE_SHARED(4)
+    WHT_STAGE_SHARED(8)
+    WHT_STAGE_SHARED(16)
     WHT_STAGE_SHARED(32)
     if (GROUP_SIZE == 128) { WHT_STAGE_SHARED(64) }
 #undef WHT_STAGE_SHARED
@@ -692,32 +681,22 @@ static __global__ void k_set_rows_turbo2(
     __syncthreads();
 
     // ---- Step 4: Forward WHT ----
-    // Lift to register, intra-warp stages via shuffle.
-    float val2 = x[j];
     if (GROUP_SIZE == 128) {
-        val2 *= TURBO_WHT_SIGNS1[j];
+        x[j] *= TURBO_WHT_SIGNS1[j];
     } else {
-        val2 *= TURBO_WHT_SIGNS1_64[j];
+        x[j] *= TURBO_WHT_SIGNS1_64[j];
     }
-
-#define WHT_STAGE_WARP_T2(h) \
-    { const float other = __shfl_xor_sync(0xffffffff, val2, h); \
-      val2 = (j & (h)) ? (other - val2) : (val2 + other); }
-
-    WHT_STAGE_WARP_T2(1)
-    WHT_STAGE_WARP_T2(2)
-    WHT_STAGE_WARP_T2(4)
-    WHT_STAGE_WARP_T2(8)
-    WHT_STAGE_WARP_T2(16)
-#undef WHT_STAGE_WARP_T2
-
-    x[j] = val2;
     __syncthreads();
 
 #define WHT_STAGE_SHARED_T2(h) \
     if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
     __syncthreads();
 
+    WHT_STAGE_SHARED_T2(1)
+    WHT_STAGE_SHARED_T2(2)
+    WHT_STAGE_SHARED_T2(4)
+    WHT_STAGE_SHARED_T2(8)
+    WHT_STAGE_SHARED_T2(16)
     WHT_STAGE_SHARED_T2(32)
     if (GROUP_SIZE == 128) { WHT_STAGE_SHARED_T2(64) }
 #undef WHT_STAGE_SHARED_T2
