@@ -170,12 +170,20 @@ bool ggml_cuda_ctp_copy_tensor(
         return false;
     }
 
-    // Allocate temporary compressed buffers on source device
+    // Allocate temporary compressed buffers on source device.
+    // If allocation fails (tight VRAM), fall back to raw copy silently.
     ggml_cuda_set_device(src_device);
-    int8_t * src_compressed_qs;
-    float  * src_compressed_d;
-    CUDA_CHECK(cudaMallocAsync(&src_compressed_qs, qs_bytes, src_stream));
-    CUDA_CHECK(cudaMallocAsync(&src_compressed_d,  d_bytes,  src_stream));
+    int8_t * src_compressed_qs = nullptr;
+    float  * src_compressed_d  = nullptr;
+    if (cudaMallocAsync(&src_compressed_qs, qs_bytes, src_stream) != cudaSuccess) {
+        cudaGetLastError(); // clear error
+        return false;
+    }
+    if (cudaMallocAsync(&src_compressed_d, d_bytes, src_stream) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFreeAsync(src_compressed_qs, src_stream);
+        return false;
+    }
 
     // Quantize on source device
     const int threads_per_block = 256;
@@ -191,10 +199,19 @@ bool ggml_cuda_ctp_copy_tensor(
 
     // Allocate receiving buffers on destination device
     ggml_cuda_set_device(dst_device);
-    int8_t * dst_compressed_qs;
-    float  * dst_compressed_d;
-    CUDA_CHECK(cudaMallocAsync(&dst_compressed_qs, qs_bytes, dst_stream));
-    CUDA_CHECK(cudaMallocAsync(&dst_compressed_d,  d_bytes,  dst_stream));
+    int8_t * dst_compressed_qs = nullptr;
+    float  * dst_compressed_d  = nullptr;
+    if (cudaMallocAsync(&dst_compressed_qs, qs_bytes, dst_stream) != cudaSuccess ||
+        cudaMallocAsync(&dst_compressed_d,  d_bytes,  dst_stream) != cudaSuccess) {
+        cudaGetLastError();
+        // Can't allocate on dest — wait for src quantize to finish then free src buffers
+        ggml_cuda_set_device(src_device);
+        cudaStreamSynchronize(src_stream);
+        cudaFreeAsync(src_compressed_qs, src_stream);
+        cudaFreeAsync(src_compressed_d,  src_stream);
+        if (dst_compressed_qs) { ggml_cuda_set_device(dst_device); cudaFreeAsync(dst_compressed_qs, dst_stream); }
+        return false;
+    }
 
     // Wait for quantization to complete before transferring
     cudaEvent_t quant_done;
