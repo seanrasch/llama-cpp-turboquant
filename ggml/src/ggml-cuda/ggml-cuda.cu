@@ -19,6 +19,7 @@
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
+#include "ggml-cuda/ctp.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
@@ -2900,7 +2901,19 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            // CTP: try compressed transfer for large cross-device copies
+            bool ctp_used = false;
+            if (ggml_cuda_ctp_enabled() && src->type == dst->type) {
+                ctp_used = ggml_cuda_ctp_copy_tensor(
+                    cuda_ctx_src->device, cuda_ctx_dst->device,
+                    src->data, dst->data,
+                    src->type,
+                    ggml_nelements(src),
+                    cuda_ctx_src->stream(), cuda_ctx_dst->stream());
+            }
+            if (!ctp_used) {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            }
 #endif
         }
 
