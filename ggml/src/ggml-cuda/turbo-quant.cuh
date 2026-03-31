@@ -419,3 +419,42 @@ static __device__ __forceinline__ float turbo2_dequant_element(
     uint8_t idx = (x->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
     return TURBO_CENTROIDS_2BIT[idx] * norm;
 }
+
+// ---- Dequantization ratio for turbo2h ----
+#define QR_TURBO2H 1
+
+// ---- turbo2h outlier mask: every 4th channel (32 of 128) ----
+// Stored as a bitmask: bit j of word j/32 = 1 if channel j is an outlier.
+// Pattern: channels 0,4,8,...,124 are outliers.
+
+static __constant__ uint32_t TURBO2H_OUTLIER_MASK[4] = {
+    0x11111111u, 0x11111111u, 0x11111111u, 0x11111111u
+};
+
+// Check if channel j (0..127) is an outlier
+static __device__ __forceinline__ bool turbo2h_is_outlier(int j) {
+    return (j % 4) == 0;
+}
+
+// Map outlier channel index to its sign bit position (0..31)
+static __device__ __forceinline__ int turbo2h_sign_idx(int j) {
+    return j / 4;  // channels 0,4,8,...,124 → sign indices 0,1,2,...,31
+}
+
+// ---- Inline dequant helper: extract one float from turbo2h block ----
+
+static __device__ __forceinline__ float turbo2h_dequant_element(
+        const block_turbo2h_0 * __restrict__ x, int j, float norm) {
+    uint8_t low2 = (x->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+
+    if (turbo2h_is_outlier(j)) {
+        // Outlier: reconstruct 3-bit index from low2 + sign bit
+        int si = turbo2h_sign_idx(j);
+        uint8_t hi1 = (x->outlier_signs[si / 8] >> (si % 8)) & 0x1;
+        uint8_t idx3 = low2 | (hi1 << 2);
+        return TURBO_CENTROIDS_3BIT[idx3] * norm;
+    } else {
+        // Regular: 2-bit centroid
+        return TURBO_CENTROIDS_2BIT[low2] * norm;
+    }
+}

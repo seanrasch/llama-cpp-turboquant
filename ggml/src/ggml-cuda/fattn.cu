@@ -324,6 +324,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
+    // TurboQuant2H (2.5-bit hybrid, symmetric + q8_0 mixed)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2H_0, GGML_TYPE_TURBO2H_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2H_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,      GGML_TYPE_TURBO2H_0)
+
     GGML_ABORT("fatal error");
 }
 
@@ -401,7 +407,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type != V->type) {
         // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
         auto is_turbo = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_Q8_0;
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO2H_0 || t == GGML_TYPE_Q8_0;
         };
         if (!is_turbo(K->type) || !is_turbo(V->type)) {
             return BEST_FATTN_KERNEL_NONE;
