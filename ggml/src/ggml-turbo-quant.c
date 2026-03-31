@@ -419,6 +419,162 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
+/* ---------- TURBO2H_0: outlier-aware 2.5-bit hybrid ---------- */
+
+/* Default outlier mask: evenly spaced, every 4th channel.
+ * Will be replaced by calibration data if TURBO_OUTLIER_SPLIT=1 */
+static int turbo2h_outlier_mask[128] = {
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+    1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
+};
+
+/* Map from channel index (0..127) to outlier sign index (0..31).
+ * Only valid for channels where turbo2h_outlier_mask[ch] == 1. */
+static int turbo2h_outlier_sign_idx[128];
+static int turbo2h_mask_initialized = 0;
+
+static void turbo2h_init_mask(void) {
+    if (turbo2h_mask_initialized) return;
+    int sign_idx = 0;
+    for (int i = 0; i < 128; i++) {
+        if (turbo2h_outlier_mask[i]) {
+            turbo2h_outlier_sign_idx[i] = sign_idx++;
+        } else {
+            turbo2h_outlier_sign_idx[i] = -1;
+        }
+    }
+    assert(sign_idx == QK_TURBO2H_OUTLIERS);
+    turbo2h_mask_initialized = 1;
+}
+
+void quantize_row_turbo2h_0_ref(const float * GGML_RESTRICT x, block_turbo2h_0 * GGML_RESTRICT y, int64_t k) {
+    turbo2h_init_mask();
+    assert(k % QK_TURBO2H == 0);
+
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
+
+    const int n_groups = k / group_size;
+    const int blocks_per_group = group_size / QK_TURBO2H;
+
+    for (int g = 0; g < n_groups; g++) {
+        const float * grp_src = x + g * group_size;
+        block_turbo2h_0 * grp_dst = y + g * blocks_per_group;
+
+        /* 1. L2 norm */
+        float norm_sq = 0.0f;
+        float buf[128];
+        for (int j = 0; j < group_size; j++) {
+            buf[j] = grp_src[j];
+            norm_sq += buf[j] * buf[j];
+        }
+        float grp_norm = sqrtf(norm_sq);
+        float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+        /* 2. Normalize */
+        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
+
+        /* 3. Forward WHT rotation */
+        turbo_cpu_fwht(buf, group_size);
+
+        /* 4. Quantize: all channels get 2-bit qs, outliers also get sign bit */
+        float recon_sq = 0.0f;
+        for (int b = 0; b < blocks_per_group; b++) {
+            block_turbo2h_0 * blk = &grp_dst[b];
+            const int off = b * QK_TURBO2H;
+
+            memset(blk->qs, 0, QK_TURBO2H / 4);
+            memset(blk->outlier_signs, 0, QK_TURBO2H_OUTLIERS / 8);
+
+            for (int j = 0; j < QK_TURBO2H; j++) {
+                float rv = buf[off + j];
+                int ch = off + j;  /* channel index within group */
+
+                if (turbo2h_outlier_mask[ch]) {
+                    /* Outlier channel: 3-bit quantization */
+                    int idx3 = nearest_centroid_3bit(rv);
+                    uint8_t low2 = idx3 & 0x3;
+                    uint8_t hi1 = (idx3 >> 2) & 0x1;
+
+                    blk->qs[j / 4] |= low2 << ((j % 4) * 2);
+
+                    /* Pack sign bit into outlier_signs */
+                    int si = turbo2h_outlier_sign_idx[ch];
+                    blk->outlier_signs[si / 8] |= hi1 << (si % 8);
+
+                    recon_sq += CENTROIDS_3BIT[idx3] * CENTROIDS_3BIT[idx3];
+                } else {
+                    /* Regular channel: 2-bit quantization */
+                    int idx2 = nearest_centroid_2bit(rv);
+                    blk->qs[j / 4] |= (idx2 & 0x3) << ((j % 4) * 2);
+
+                    recon_sq += CENTROIDS_2BIT[idx2] * CENTROIDS_2BIT[idx2];
+                }
+            }
+        }
+
+        /* 5. Corrected norm */
+        float recon_norm = sqrtf(recon_sq);
+        float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+        for (int b = 0; b < blocks_per_group; b++) {
+            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
+        }
+    }
+}
+
+void dequantize_row_turbo2h_0(const block_turbo2h_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    turbo2h_init_mask();
+    assert(k % QK_TURBO2H == 0);
+    const int nb = k / QK_TURBO2H;
+
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int j = 0; j < QK_TURBO2H; j++) {
+            uint8_t low2 = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
+            int ch = block * QK_TURBO2H + j;  /* global channel — wraps per group */
+            int ch_in_group = j;               /* channel within block = within group (block_size=128) */
+
+            if (turbo2h_outlier_mask[ch_in_group]) {
+                /* Outlier: reconstruct 3-bit index */
+                int si = turbo2h_outlier_sign_idx[ch_in_group];
+                uint8_t hi1 = (x[block].outlier_signs[si / 8] >> (si % 8)) & 0x1;
+                uint8_t idx3 = low2 | (hi1 << 2);
+                y[block * QK_TURBO2H + j] = CENTROIDS_3BIT[idx3] * norm;
+            } else {
+                /* Regular: 2-bit centroid */
+                y[block * QK_TURBO2H + j] = CENTROIDS_2BIT[low2] * norm;
+            }
+        }
+    }
+}
+
+size_t quantize_turbo2h_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO2H == 0);
+
+    size_t row_size = (n_per_row / QK_TURBO2H) * sizeof(block_turbo2h_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo2h_0_ref(
+            src + row * n_per_row,
+            (block_turbo2h_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
 /* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
