@@ -333,6 +333,24 @@ typedef struct {
 } block_turbo2_0;                       // 10 bytes total
 static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
 
+// TurboQuant 2.5-bit hybrid: outlier-aware channel splitting (paper Section 4.3)
+// 32 outlier channels at 3-bit (8 centroids), 96 regular channels at 2-bit (4 centroids).
+// Outlier channels identified by per-channel variance after WHT rotation.
+// Per block: norm(fp16) + 2-bit indices (32 bytes) + outlier signs (4 bytes) = 38 bytes per 128
+// = 2.375 bits/value → 6.7× compression vs fp16
+#define QK_TURBO2H 128
+#define QK_TURBO2H_GROUP 128
+#define QK_TURBO2H_OUTLIERS 32
+#define NL_TURBO2H     (QK_TURBO2H / 16)
+#define NL_TURBO2H_VEC (QK_TURBO2H / 4)
+typedef struct {
+    ggml_half  norm;                                    //  2 bytes: corrected L2 norm
+    uint8_t    qs[QK_TURBO2H / 4];                     // 32 bytes: 2-bit indices for all 128 channels
+    uint8_t    outlier_signs[QK_TURBO2H_OUTLIERS / 8];  //  4 bytes: 1-bit sign for 32 outlier channels
+} block_turbo2h_0;                                      // 38 bytes total
+static_assert(sizeof(block_turbo2h_0) == sizeof(ggml_half) + QK_TURBO2H/4 + QK_TURBO2H_OUTLIERS/8,
+    "wrong turbo2h_0 block size/padding");
+
 //
 // Super-block quantization structures
 //
