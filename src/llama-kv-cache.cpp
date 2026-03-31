@@ -144,12 +144,25 @@ llama_kv_cache::llama_kv_cache(
             // risk quantization stacking on K-sensitive models.
             const ggml_type embd_type = model.tok_embd ? model.tok_embd->type : GGML_TYPE_F16;
             const bool weights_quantized = ggml_is_quantized(embd_type);
-            if (weights_quantized) {
+
+            // Skip auto-asymmetric when K and V have different head dims (e.g. DeepSeek
+            // head_k=192, head_v=128). Switching K to q8_0 at non-standard D creates FA
+            // dimension mismatch (no CUDA FA kernel for D=192). Keep symmetric turbo
+            // which pads both K and V consistently.
+            const uint32_t head_k_0 = hparams.n_embd_head_k(0);
+            const uint32_t head_v_0 = hparams.n_embd_head_v(0);
+            const bool mismatched_d = (head_k_0 != head_v_0);
+
+            if (weights_quantized && !mismatched_d) {
                 LLAMA_LOG_WARN("%s: model has quantized weights — auto-switching K cache to q8_0 "
                                "for safe asymmetric mode (V stays %s). "
                                "Set TURBO_SYMMETRIC=1 to force symmetric turbo K+V.\n",
                                __func__, ggml_type_name(type_v));
                 type_k = GGML_TYPE_Q8_0;
+            } else if (weights_quantized && mismatched_d) {
+                LLAMA_LOG_INFO("%s: asymmetric K/V dims (K=%u, V=%u) — keeping symmetric turbo "
+                               "(asymmetric would lose CUDA FA)\n",
+                               __func__, head_k_0, head_v_0);
             }
         }
     }
