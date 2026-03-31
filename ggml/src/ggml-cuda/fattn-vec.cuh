@@ -340,6 +340,11 @@ static __global__ void flash_attn_ext_vec(
                     if (__hgt(__low2half(KQ_k[j]), sparse_v_threshold_h)) { dominated = false; break; }
                 }
                 if (dominated) { continue; }
+
+                // Hard eviction: mark this position as attended in the bitmap
+                if (d_eviction_enabled && d_eviction_attend_bitmap && threadIdx.x == 0 && threadIdx.y == 0) {
+                    atomicOr(&d_eviction_attend_bitmap[k / 32], 1u << (k % 32));
+                }
             }
 
 #pragma unroll
@@ -380,6 +385,11 @@ static __global__ void flash_attn_ext_vec(
                     if (KQ_k[j] >= sparse_v_threshold_f) { dominated = false; break; }
                 }
                 if (dominated) { continue; }
+
+                // Hard eviction: mark this position as attended in the bitmap
+                if (d_eviction_enabled && d_eviction_attend_bitmap && threadIdx.x == 0 && threadIdx.y == 0) {
+                    atomicOr(&d_eviction_attend_bitmap[k / 32], 1u << (k % 32));
+                }
             }
 
 #pragma unroll

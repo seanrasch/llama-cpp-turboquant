@@ -1161,6 +1161,60 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+uint32_t llama_kv_cache::eviction_process(const uint32_t * attend_bitmap, uint32_t n_kv, uint32_t stream_idx) {
+    if (!eviction.enabled || !attend_bitmap || n_kv == 0) return 0;
+
+    auto & cells = v_cells[stream_idx];
+    const uint32_t n_cells = cells.size();
+
+    // ensure skip_count is sized
+    if (eviction.skip_count.size() < n_cells) {
+        eviction.resize(n_cells);
+    }
+
+    // find the max used position for recency protection
+    uint32_t max_used = 0;
+    for (uint32_t i = 0; i < n_kv; i++) {
+        if (!cells.is_empty(i)) max_used = i;
+    }
+    const uint32_t recency_floor = (max_used > eviction.recency_protect) ? (max_used - eviction.recency_protect) : 0;
+
+    uint32_t n_evicted = 0;
+
+    for (uint32_t i = 0; i < n_kv && i < n_cells; i++) {
+        if (cells.is_empty(i)) continue;
+
+        const bool attended = (attend_bitmap[i / 32] >> (i % 32)) & 1;
+
+        if (attended) {
+            eviction.skip_count[i] = 0;
+        } else {
+            // attention sink protection
+            if (i < eviction.sink_protect) continue;
+            // recency protection
+            if (i >= recency_floor) continue;
+
+            if (eviction.skip_count[i] < UINT16_MAX) {
+                eviction.skip_count[i]++;
+            }
+
+            if (eviction.skip_count[i] >= eviction.evict_threshold) {
+                cells.rm(i);
+                eviction.skip_count[i] = 0;
+                n_evicted++;
+            }
+        }
+    }
+
+    eviction.n_evicted_total += n_evicted;
+
+    if (n_evicted > 0 && debug > 0) {
+        LLAMA_LOG_DEBUG("%s: evicted %u cells (total: %u)\n", __func__, n_evicted, eviction.n_evicted_total);
+    }
+
+    return n_evicted;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

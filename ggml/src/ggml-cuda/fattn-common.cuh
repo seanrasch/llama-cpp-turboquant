@@ -7,6 +7,20 @@
 
 #include <cstdint>
 
+// Hard eviction: device-side attend bitmap. Written by FA VEC kernel (atomicOr),
+// read by CPU after decode step to update per-position skip counters.
+// Allocated lazily on first use. Size: ceil(n_ctx / 32) uint32_t words.
+// Bit set = position was attended (at least one head had weight > sparse_v_threshold).
+// Reset to zero before each decode step by the caller.
+extern uint32_t * d_eviction_attend_bitmap;
+extern uint32_t   d_eviction_bitmap_size;   // number of uint32 words allocated
+extern bool       d_eviction_enabled;
+
+// Host-side functions (defined in fattn.cu)
+void eviction_bitmap_ensure(uint32_t n_kv);
+void eviction_bitmap_reset(cudaStream_t stream);
+void eviction_bitmap_read(uint32_t * host_dst, uint32_t n_words, cudaStream_t stream);
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.

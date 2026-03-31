@@ -6,6 +6,36 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+// ---- Hard eviction bitmap globals ----
+uint32_t * d_eviction_attend_bitmap = nullptr;
+uint32_t   d_eviction_bitmap_size   = 0;
+bool       d_eviction_enabled       = false;
+
+void eviction_bitmap_ensure(uint32_t n_kv) {
+    uint32_t n_words = (n_kv + 31) / 32;
+    if (n_words <= d_eviction_bitmap_size) return;
+
+    if (d_eviction_attend_bitmap) {
+        cudaFree(d_eviction_attend_bitmap);
+    }
+    cudaMalloc(&d_eviction_attend_bitmap, n_words * sizeof(uint32_t));
+    d_eviction_bitmap_size = n_words;
+}
+
+void eviction_bitmap_reset(cudaStream_t stream) {
+    if (d_eviction_attend_bitmap && d_eviction_bitmap_size > 0) {
+        cudaMemsetAsync(d_eviction_attend_bitmap, 0, d_eviction_bitmap_size * sizeof(uint32_t), stream);
+    }
+}
+
+void eviction_bitmap_read(uint32_t * host_dst, uint32_t n_words, cudaStream_t stream) {
+    if (!d_eviction_attend_bitmap || n_words == 0) return;
+    uint32_t copy_words = (n_words < d_eviction_bitmap_size) ? n_words : d_eviction_bitmap_size;
+    cudaMemcpyAsync(host_dst, d_eviction_attend_bitmap, copy_words * sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);  // must complete before CPU reads
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

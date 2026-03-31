@@ -152,6 +152,11 @@ public:
 
     bool get_has_shift() const;
 
+    // hard eviction: process attend bitmap from FA kernel, update skip counts, evict if threshold exceeded
+    // bitmap: 1 bit per KV position, 1 = attended, 0 = dominated. size = ceil(n_kv / 32) uint32_t words.
+    // returns number of cells evicted in this call.
+    uint32_t eviction_process(const uint32_t * attend_bitmap, uint32_t n_kv, uint32_t stream_idx = 0);
+
     //
     // graph_build API
     //
@@ -228,6 +233,19 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    // hard eviction state — extends sparse V dequant skip to permanent memory reclamation
+    struct eviction_state {
+        std::vector<uint16_t> skip_count;   // per-cell consecutive sparse-V-skip counter
+        uint32_t evict_threshold = 128;     // consecutive skips before hard eviction
+        uint32_t sink_protect    = 16;      // never evict first N positions (attention sinks)
+        uint32_t recency_protect = 256;     // never evict last N positions
+        uint32_t n_evicted_total = 0;       // lifetime eviction counter
+        bool     enabled         = false;
+
+        void resize(uint32_t n) { skip_count.assign(n, 0); }
+        void reset(uint32_t cell) { if (cell < skip_count.size()) skip_count[cell] = 0; }
+    } eviction;
 
     // required padding
     const uint32_t n_pad = 1;
