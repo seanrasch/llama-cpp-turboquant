@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-turbo-flash.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -568,6 +569,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // TurboFlash fast path: two-pass fused asymmetric attention for turbo3 V
+    // single-token decode. Takes precedence over the generic VEC kernel
+    // whenever eligible. See fattn-turbo-flash.{cuh,cu}.
+    if (ggml_cuda_flash_attn_ext_use_turbo_flash(dst)) {
+        ggml_cuda_flash_attn_ext_turbo_flash(ctx, dst);
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
