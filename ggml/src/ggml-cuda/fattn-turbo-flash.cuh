@@ -319,49 +319,17 @@ __global__ void turbo_flash_p2_kernel(
     }
     __syncthreads();
 
-    // ─── Step 3: Inverse WHT (s2 → butterfly → s1 × 1/√DV) ───────────────
-    // Only the first min(DV, 128) elements participate in the rotation group.
-    if (tid < DV && tid < 128) {
-        // 3a: s2 signs
-        float val = shared_out[tid] * TURBO_WHT_SIGNS2[tid];
-
-        // 3b: butterfly — first up-to-5 stages via warp shuffle (intra-warp).
-        //     log2(DV): 128→7, 96→? (non-power-of-2, skip), 64→6, 32→5.
-        //     DV=96 is handled by a separate scalar fallback (3 stages cover 32).
-        constexpr int log2_dv = (DV >= 128) ? 7 : (DV >= 64) ? 6 : 5;
-        constexpr int simd_stages = (log2_dv < 5) ? log2_dv : 5;
-
-        const int lane_in_warp = tid % 32;
-#pragma unroll
-        for (int s = 0; s < simd_stages; s++) {
-            const int  step = 1 << s;
-            const float other = __shfl_xor_sync(0xffffffff, val, step);
-            val = (lane_in_warp & step) ? (other - val) : (other + val);
-        }
-
-        // 3c: remaining cross-warp stages via shared memory (DV > 32)
-        if (DV > 32) {
-            shared_out[tid] = val;
-            __syncthreads();
-
-            for (int half_block = 32; half_block < DV; half_block <<= 1) {
-                const int bfly_size = half_block << 1;
-                const int bfly_idx  = tid / bfly_size;
-                const int local_idx = tid % bfly_size;
-                const int base_idx  = bfly_idx * bfly_size;
-
-                const float a = shared_out[base_idx + (local_idx % half_block)];
-                const float b = shared_out[base_idx + (local_idx % half_block) + half_block];
-                __syncthreads();
-
-                shared_out[tid] = (local_idx < half_block) ? (a + b) : (a - b);
-                __syncthreads();
-            }
-            val = shared_out[tid];
-        }
-
-        // 3d: s1 signs + 1/√DV normalization
-        const float inv_sqrt_dim = rsqrtf((float)DV);
-        dst[(uint64_t)bh_idx * DV + tid] = val * inv_sqrt_dim * TURBO_WHT_SIGNS1[tid];
+    // ─── Step 3: Write merged output (rotated domain) ────────────────────
+    //
+    // IMPORTANT: do NOT apply the inverse WHT here. The llama graph
+    // (src/llama-graph.cpp ~line 1886) appends a standalone
+    // ggml_turbo_wht(..., direction=1) op immediately after every
+    // ggml_flash_attn_ext when V is turbo-rotated. Rotating here would
+    // cancel with that op and produce garbage output -- a bug we hit on
+    // the first run of this kernel. The git history of this file holds a
+    // reference in-kernel inverse WHT implementation if a future TheTom
+    // change lifts the graph op for TurboFlash-eligible FA ops.
+    if (tid < DV) {
+        dst[(uint64_t)bh_idx * DV + tid] = shared_out[tid];
     }
 }
